@@ -1,0 +1,16 @@
+# Echte Konfiguration mit Koordinaten - NICHT ins oeffentliche Repo!
+config.ini
+
+# Laufzeitdaten
+data/
+logs/
+*.db
+*.db-wal
+*.db-shm
+*.tmp
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
