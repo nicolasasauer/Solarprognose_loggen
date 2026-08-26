@@ -13,38 +13,67 @@ sind keine `pip`-Pakete nötig.
 
 ---
 
+## Wo was liegt
+
+Code, Konfiguration und Daten sind bewusst getrennt, damit ein `git pull` immer
+nur den Code aktualisiert und deine Einstellungen und Messwerte nie anfasst:
+
+| | Ort | |
+|---|---|---|
+| Code | `~/Solarprognose_loggen` | kommt aus Git, wird überschrieben |
+| Konfiguration | `~/.config/solarprognose/config.ini` | einmalig anlegen, bleibt für immer |
+| Daten | `~/solarprognose/` | TXT-Dateien, Datenbank, Logs |
+
+Beide Pfade sind verschiebbar: die Konfiguration über `--config` oder die
+Umgebungsvariable `SOLARPROGNOSE_CONFIG`, das Datenverzeichnis über `base_dir`
+in der Konfiguration.
+
+---
+
 ## Installation auf dem Raspberry Pi
 
-```bash
-cd ~ && git clone https://github.com/<DEIN-USER>/Solarprognose_loggen.git
-```
+Voraussetzung ist Python 3.9 oder neuer — Raspberry Pi OS Bookworm bringt 3.11
+bereits mit, `python3 --version` bestätigt das.
+
+Repository klonen:
 
 ```bash
-cd ~/Solarprognose_loggen && cp config.example.ini config.ini && chmod +x solarprognose.py
+cd ~ && git clone https://github.com/nicolasasauer/Solarprognose_loggen.git
 ```
 
-Danach `config.ini` mit deinen echten Standorten füllen. Diese Datei steht in
-`.gitignore` und wird **nicht** ins Repository übertragen — die Koordinaten sind
-personenbezogene Daten und gehören nicht in ein öffentliches Repo.
-
-Voraussetzung ist Python 3.9 oder neuer (Raspberry Pi OS Bookworm bringt 3.11 mit):
+Konfiguration einmalig anlegen:
 
 ```bash
-python3 --version
+python3 ~/Solarprognose_loggen/solarprognose.py --init-config
 ```
 
-Erster Testlauf, der nur abruft und prüft, aber nichts schreibt:
+Standorte eintragen:
+
+```bash
+nano ~/.config/solarprognose/config.ini
+```
+
+Testlauf, der abruft und prüft, aber nichts schreibt:
 
 ```bash
 python3 ~/Solarprognose_loggen/solarprognose.py --dry-run -v
 ```
 
+Ab jetzt genügt für Code-Updates:
+
+```bash
+cd ~/Solarprognose_loggen && git pull
+```
+
+Deine `config.ini` liegt außerhalb des Repositorys und bleibt davon unberührt.
+Selbst ein komplett neues `git clone` würde sie nicht antasten.
+
 ---
 
 ## Konfiguration
 
-Alles steckt in `config.ini`. Pro Anlage ein Abschnitt `[Standort:LABEL]`; das
-Label landet unverändert im Dateinamen und in der Datenbank.
+Alles steckt in `~/.config/solarprognose/config.ini`. Pro Anlage ein Abschnitt
+`[Standort:LABEL]`; das Label landet unverändert im Dateinamen und in der Datenbank.
 
 ```ini
 [Standort:RT_Tr]
@@ -56,6 +85,9 @@ kwp         = 5.5         ; installierte Leistung
 timezone    = Europe/Berlin
 ```
 
+Zwei Nachkommastellen bei den Koordinaten reichen völlig aus — auf ~1 km gerundet
+liefert die API ein identisches Ergebnis, das Wettermodell arbeitet ohnehin gröber.
+
 Der Dateiname entsteht aus `filename_prefix`, Label und **Abrufdatum**:
 `Solardaten_RT_Tr_2026-08-27.txt`.
 
@@ -63,6 +95,7 @@ Wichtige Schalter im Abschnitt `[global]`:
 
 | Schlüssel | Bedeutung |
 |---|---|
+| `base_dir` | Basis für alle relativen Pfade, ohne Angabe `~/solarprognose` |
 | `timeout_seconds` | Zeitlimit pro HTTP-Versuch (Standard 60) |
 | `retries` | Versuche pro Standort und Lauf (Standard 3) |
 | `retry_delay_seconds` | Wartezeit zwischen Versuchen, wächst mit jedem Versuch |
@@ -81,6 +114,10 @@ Wichtige Schalter im Abschnitt `[global]`:
 0 8  * * * /usr/bin/python3 /home/pi/Solarprognose_loggen/solarprognose.py
 0 11 * * * /usr/bin/python3 /home/pi/Solarprognose_loggen/solarprognose.py
 ```
+
+Cron kennt keine Tilde, deshalb der ausgeschriebene Pfad. Heißt dein Benutzer
+nicht `pi` — bei aktuellen Raspberry-Pi-OS-Installationen wählst du den Namen
+selbst — dann ersetze ihn; `echo $HOME` verrät dir den richtigen Pfad.
 
 Der Trick liegt in `skip_if_already_fetched_today`: Der 5-Uhr-Lauf holt die Daten,
 die Läufe um 8 und 11 Uhr sehen den erfolgreichen Eintrag in der Tabelle `abruf`
@@ -144,11 +181,11 @@ sudo grafana-cli plugins install frser-sqlite-datasource && sudo systemctl resta
 ```
 
 Anschließend eine Datenquelle vom Typ *SQLite* mit dem Pfad zur `solarprognose.db`
-anlegen. Der Grafana-Benutzer braucht Leserechte auf die Datei und auf das
-darüberliegende Verzeichnis:
+anlegen — standardmäßig `~/solarprognose/solarprognose.db`. Der Grafana-Benutzer
+braucht Leserechte auf die Datei und auf das darüberliegende Verzeichnis:
 
 ```bash
-sudo chmod o+rx /home/pi/Solarprognose_loggen && sudo chmod o+r /home/pi/Solarprognose_loggen/solarprognose.db
+sudo chmod o+rx ~/solarprognose && sudo chmod o+r ~/solarprognose/solarprognose.db
 ```
 
 Die Datenbank läuft bewusst nicht im WAL-Modus, denn dort bräuchte selbst ein
@@ -192,17 +229,17 @@ liegen.
 
 ## Betrieb
 
-Das Skript protokolliert nach `logs/solarprognose.log` (rotierend, fünf Dateien à
+Das Skript protokolliert nach `~/solarprognose/logs/solarprognose.log` (rotierend, fünf Dateien à
 1 MB). Der Exit-Code ist `0` bei Erfolg und `1`, sobald mindestens ein Standort
 endgültig gescheitert ist.
 
 Fehlgeschlagene Läufe der letzten Woche anzeigen:
 
 ```bash
-sqlite3 ~/Solarprognose_loggen/solarprognose.db "SELECT abruf_utc, standort, fehler FROM abruf WHERE erfolg=0 AND abruf_utc > datetime('now','-7 days');"
+sqlite3 ~/solarprognose/solarprognose.db "SELECT abruf_utc, standort, fehler FROM abruf WHERE erfolg=0 AND abruf_utc > datetime('now','-7 days');"
 ```
 
-Für eine aktive Benachrichtigung lässt sich `notify_command` in der `config.ini`
+Für eine aktive Benachrichtigung lässt sich `notify_command` in der Konfiguration
 setzen, zum Beispiel über [ntfy.sh](https://ntfy.sh):
 
 ```ini

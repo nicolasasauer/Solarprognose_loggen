@@ -2,7 +2,13 @@
 """Holt Solarprognosen von forecast.solar, speichert sie als TXT und in SQLite.
 
 Nur Standardbibliothek - auf einem Raspberry Pi (Python 3.9+) ohne pip lauffaehig.
-Aufruf:  ./solarprognose.py [--config config.ini] [--force] [--dry-run]
+Aufruf:  ./solarprognose.py [--config PFAD] [--force] [--dry-run]
+
+Konfiguration und Daten liegen bewusst ausserhalb des Repositorys, damit ein
+"git pull" niemals eigene Einstellungen oder Messwerte anfasst:
+    Konfiguration  ~/.config/solarprognose/config.ini
+    Daten          ~/solarprognose/  (TXT-Dateien, Datenbank, Logs)
+Beides ist ueber --config bzw. base_dir frei verschiebbar.
 """
 
 import argparse
@@ -11,6 +17,7 @@ import logging
 import logging.handlers
 import os
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -23,6 +30,10 @@ from zoneinfo import ZoneInfo
 API_BASE = "https://api.forecast.solar/estimate"
 USER_AGENT = "solarprognose-logger/1.0 (+stdlib)"
 VALID_TYPES = ("watts", "watt_hours_period", "watt_hours", "watt_hours_day")
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+USER_CONFIG = os.path.join(os.path.expanduser("~"), ".config", "solarprognose", "config.ini")
+DEFAULT_BASE_DIR = os.path.join(os.path.expanduser("~"), "solarprognose")
 
 log = logging.getLogger("solarprognose")
 
@@ -56,21 +67,79 @@ class Standort:
                                       self.declination, self.azimuth, self.kwp)
 
 
+def find_config(explicit):
+    """Konfiguration suchen: --config, dann Umgebungsvariable, dann Standardorte."""
+    if explicit:
+        if not os.path.isfile(explicit):
+            raise SystemExit("Konfigurationsdatei nicht gefunden: %s" % explicit)
+        return explicit
+    env = os.environ.get("SOLARPROGNOSE_CONFIG")
+    if env:
+        if not os.path.isfile(env):
+            raise SystemExit("SOLARPROGNOSE_CONFIG zeigt auf eine nicht vorhandene Datei: %s" % env)
+        return env
+    # Repo-lokale config.ini nur als Rueckfallebene, damit Entwicklung auf einem
+    # Arbeitsplatzrechner ohne Extra-Pfade funktioniert.
+    for candidate in (USER_CONFIG, os.path.join(HERE, "config.ini")):
+        if os.path.isfile(candidate):
+            return candidate
+    raise SystemExit(
+        "Keine Konfiguration gefunden. Gesucht wurde in:\n"
+        "  %s\n  %s\n\n"
+        "Einmalig anlegen mit:\n"
+        "  python3 %s --init-config" % (USER_CONFIG, os.path.join(HERE, "config.ini"),
+                                        os.path.join(HERE, "solarprognose.py")))
+
+
+def init_config(target=None):
+    """Legt einmalig eine Konfiguration aus der Vorlage an."""
+    target = target or USER_CONFIG
+    vorlage = os.path.join(HERE, "config.example.ini")
+    if not os.path.isfile(vorlage):
+        raise SystemExit("Vorlage nicht gefunden: %s" % vorlage)
+    if os.path.isfile(target):
+        raise SystemExit("Es gibt bereits eine Konfiguration: %s\n"
+                         "Sie wird nicht ueberschrieben - bitte direkt bearbeiten." % target)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    shutil.copyfile(vorlage, target)
+    try:
+        os.chmod(target, 0o600)
+    except OSError:
+        pass
+    print("Konfiguration angelegt: %s\n\n"
+          "Jetzt die Standorte eintragen:\n  nano %s\n\n"
+          "Diese Datei liegt ausserhalb des Repositorys - ein 'git pull' fasst sie nie an."
+          % (target, target))
+    return 0
+
+
 def load_config(path):
-    if not os.path.isfile(path):
-        raise SystemExit("Konfigurationsdatei nicht gefunden: %s" % path)
     cp = configparser.ConfigParser()
     cp.read(path, encoding="utf-8")
     if not cp.has_section("global"):
         raise SystemExit("Abschnitt [global] fehlt in %s" % path)
 
-    base = os.path.dirname(os.path.abspath(path))
+    g = cp["global"]
+    config_dir = os.path.dirname(os.path.abspath(path))
+
+    # base_dir bestimmt, worauf sich relative Pfade beziehen. Ohne Angabe landen
+    # Daten in ~/solarprognose, also ausserhalb des Repositorys. Ein relativ
+    # angegebenes base_dir wird gegen das Verzeichnis der Konfiguration aufgeloest.
+    base = g.get("base_dir", "").strip()
+    if base:
+        base = os.path.expanduser(base)
+        if not os.path.isabs(base):
+            base = os.path.normpath(os.path.join(config_dir, base))
+    else:
+        base = DEFAULT_BASE_DIR
 
     def abspath(value):
+        value = os.path.expanduser(value)
         return value if os.path.isabs(value) else os.path.normpath(os.path.join(base, value))
 
-    g = cp["global"]
     cfg = {
+        "config_path": os.path.abspath(path),
+        "base_dir": base,
         "output_dir": abspath(g.get("output_dir", "data")),
         "db_path": abspath(g.get("db_path", "solarprognose.db")),
         "log_file": abspath(g.get("log_file", "logs/solarprognose.log")),
@@ -338,9 +407,13 @@ def notify(cfg, standort, fehler):
 # --------------------------------------------------------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="Solarprognosen abrufen und speichern")
-    here = os.path.dirname(os.path.abspath(__file__))
-    ap.add_argument("--config", default=os.path.join(here, "config.ini"))
+    ap = argparse.ArgumentParser(
+        description="Solarprognosen abrufen und speichern",
+        epilog="Ohne --config wird gesucht in: $SOLARPROGNOSE_CONFIG, %s, %s"
+               % (USER_CONFIG, os.path.join(HERE, "config.ini")))
+    ap.add_argument("--config", default=None, help="Pfad zur Konfigurationsdatei")
+    ap.add_argument("--init-config", action="store_true",
+                    help="einmalig eine Konfiguration aus der Vorlage anlegen und beenden")
     ap.add_argument("--force", action="store_true",
                     help="auch abrufen, wenn heute bereits erfolgreich geladen wurde")
     ap.add_argument("--dry-run", action="store_true",
@@ -348,12 +421,16 @@ def main():
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
-    cfg, standorte = load_config(args.config)
+    if args.init_config:
+        return init_config(args.config)
+
+    cfg, standorte = load_config(find_config(args.config))
     setup_logging(cfg["log_file"], args.verbose)
 
     conn = open_db(cfg["db_path"])
     today = date.today()
     log.info("=== Lauf gestartet (%d Standort(e), %s) ===", len(standorte), today.isoformat())
+    log.debug("Konfiguration: %s | Datenverzeichnis: %s", cfg["config_path"], cfg["base_dir"])
 
     fehlgeschlagen, aktiv = [], []
     for s in standorte:
