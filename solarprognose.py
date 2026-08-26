@@ -2,13 +2,12 @@
 """Holt Solarprognosen von forecast.solar, speichert sie als TXT und in SQLite.
 
 Nur Standardbibliothek - auf einem Raspberry Pi (Python 3.9+) ohne pip lauffaehig.
-Aufruf:  ./solarprognose.py [--config PFAD] [--force] [--dry-run]
+Aufruf:  ./solarprognose.py [--config PFAD] [--force] [--dry-run] [--status]
 
-Konfiguration und Daten liegen bewusst ausserhalb des Repositorys, damit ein
-"git pull" niemals eigene Einstellungen oder Messwerte anfasst:
-    Konfiguration  ~/.config/solarprognose/config.ini
-    Daten          ~/solarprognose/  (TXT-Dateien, Datenbank, Logs)
-Beides ist ueber --config bzw. base_dir frei verschiebbar.
+Konfiguration und Daten liegen standardmaessig neben dem Skript, also z.B. in
+/home/nicolas/scripts/Solarprognose_loggen/ mit config.ini, data/, logs/ und
+solarprognose.db. Alle diese Namen stehen in .gitignore, ein "git pull" fasst
+sie also nicht an. Verschiebbar ueber --config bzw. base_dir.
 """
 
 import argparse
@@ -32,8 +31,9 @@ USER_AGENT = "solarprognose-logger/1.0 (+stdlib)"
 VALID_TYPES = ("watts", "watt_hours_period", "watt_hours", "watt_hours_day")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+LOCAL_CONFIG = os.path.join(HERE, "config.ini")
 USER_CONFIG = os.path.join(os.path.expanduser("~"), ".config", "solarprognose", "config.ini")
-DEFAULT_BASE_DIR = os.path.join(os.path.expanduser("~"), "solarprognose")
+DEFAULT_BASE_DIR = HERE
 
 log = logging.getLogger("solarprognose")
 
@@ -78,22 +78,22 @@ def find_config(explicit):
         if not os.path.isfile(env):
             raise SystemExit("SOLARPROGNOSE_CONFIG zeigt auf eine nicht vorhandene Datei: %s" % env)
         return env
-    # Repo-lokale config.ini nur als Rueckfallebene, damit Entwicklung auf einem
-    # Arbeitsplatzrechner ohne Extra-Pfade funktioniert.
-    for candidate in (USER_CONFIG, os.path.join(HERE, "config.ini")):
+    # Neben dem Skript zuerst; ~/.config bleibt als Rueckfallebene erhalten,
+    # damit aeltere Installationen weiterlaufen.
+    for candidate in (LOCAL_CONFIG, USER_CONFIG):
         if os.path.isfile(candidate):
             return candidate
     raise SystemExit(
         "Keine Konfiguration gefunden. Gesucht wurde in:\n"
         "  %s\n  %s\n\n"
         "Einmalig anlegen mit:\n"
-        "  python3 %s --init-config" % (USER_CONFIG, os.path.join(HERE, "config.ini"),
+        "  python3 %s --init-config" % (LOCAL_CONFIG, USER_CONFIG,
                                         os.path.join(HERE, "solarprognose.py")))
 
 
 def init_config(target=None):
     """Legt einmalig eine Konfiguration aus der Vorlage an."""
-    target = target or USER_CONFIG
+    target = target or LOCAL_CONFIG
     vorlage = os.path.join(HERE, "config.example.ini")
     if not os.path.isfile(vorlage):
         raise SystemExit("Vorlage nicht gefunden: %s" % vorlage)
@@ -108,7 +108,7 @@ def init_config(target=None):
         pass
     print("Konfiguration angelegt: %s\n\n"
           "Jetzt die Standorte eintragen:\n  nano %s\n\n"
-          "Diese Datei liegt ausserhalb des Repositorys - ein 'git pull' fasst sie nie an."
+          "Die Datei steht in .gitignore - ein 'git pull' fasst sie nie an."
           % (target, target))
     return 0
 
@@ -123,8 +123,8 @@ def load_config(path):
     config_dir = os.path.dirname(os.path.abspath(path))
 
     # base_dir bestimmt, worauf sich relative Pfade beziehen. Ohne Angabe landen
-    # Daten in ~/solarprognose, also ausserhalb des Repositorys. Ein relativ
-    # angegebenes base_dir wird gegen das Verzeichnis der Konfiguration aufgeloest.
+    # Daten neben dem Skript. Ein relativ angegebenes base_dir wird gegen das
+    # Verzeichnis der Konfiguration aufgeloest.
     base = g.get("base_dir", "").strip()
     if base:
         base = os.path.expanduser(base)
@@ -392,6 +392,117 @@ def store_failure(conn, standort, fehler, versuche, abruf_dt):
     conn.commit()
 
 
+# --------------------------------------------------------------------------
+# Statusbericht
+# --------------------------------------------------------------------------
+
+def _alter(delta_sekunden):
+    """Sekunden als kurze, lesbare Altersangabe."""
+    if delta_sekunden < 90:
+        return "gerade eben"
+    minuten = delta_sekunden // 60
+    if minuten < 90:
+        return "%d Min" % minuten
+    stunden = minuten // 60
+    if stunden < 48:
+        return "%d Std" % stunden
+    return "%d Tage" % (stunden // 24)
+
+
+def _lokal(utc_string):
+    """UTC-Zeitstempel aus der Datenbank als lokale Zeit ausgeben."""
+    dt = datetime.strptime(utc_string, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    return dt.astimezone(), dt
+
+
+def show_status(cfg, standorte):
+    """Kompakter Bericht. Exit 0, wenn alle Standorte heute geladen wurden."""
+    print("Konfiguration : %s" % cfg["config_path"])
+    print("Datenbasis    : %s" % cfg["base_dir"])
+
+    if not os.path.isfile(cfg["db_path"]):
+        print("Datenbank     : %s -- existiert noch nicht" % cfg["db_path"])
+        print("\nEs gab bisher keinen einzigen Lauf.")
+        return 1
+
+    conn = sqlite3.connect(cfg["db_path"], timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        gesamt = conn.execute("SELECT COUNT(*) FROM prognose").fetchone()[0]
+    except sqlite3.OperationalError:
+        print("Datenbank     : %s -- noch ohne Tabellen" % cfg["db_path"])
+        return 1
+    groesse = os.path.getsize(cfg["db_path"]) / 1024.0
+    einheit = "%.1f KB" % groesse if groesse < 1024 else "%.1f MB" % (groesse / 1024.0)
+    print("Datenbank     : %s (%s, %d Datensaetze)" % (cfg["db_path"], einheit, gesamt))
+
+    # Standorte aus der Konfiguration, dazu solche, die nur noch in der
+    # Datenbank stehen - etwa nach einer Umbenennung des Labels.
+    aus_config = [s.label for s in standorte]
+    labels = list(aus_config)
+    for row in conn.execute("SELECT DISTINCT standort FROM abruf ORDER BY standort"):
+        if row["standort"] not in labels:
+            labels.append(row["standort"])
+
+    jetzt = datetime.now(timezone.utc)
+    heute = date.today()
+    kopf = "%-16s %-19s %-12s %8s  %s" % ("STANDORT", "LETZTER ERFOLG", "ALTER",
+                                          "ZEILEN", "LETZTER FEHLER")
+    print("\n" + kopf)
+    print("-" * len(kopf))
+
+    aktuell = veraltet = 0
+    for label in labels:
+        erfolg = conn.execute(
+            "SELECT abruf_utc, zeilen FROM abruf WHERE standort=? AND erfolg=1"
+            " ORDER BY abruf_epoch DESC LIMIT 1", (label,)).fetchone()
+        fehler = conn.execute(
+            "SELECT abruf_utc, fehler FROM abruf WHERE standort=? AND erfolg=0"
+            " ORDER BY abruf_epoch DESC LIMIT 1", (label,)).fetchone()
+
+        if erfolg:
+            lokal, utc = _lokal(erfolg["abruf_utc"])
+            zeit = lokal.strftime("%Y-%m-%d %H:%M")
+            alter = _alter(int((jetzt - utc).total_seconds()))
+            zeilen = str(erfolg["zeilen"] or 0)
+            if lokal.date() == heute:
+                aktuell += 1
+            else:
+                veraltet += 1
+                alter = "! " + alter
+        else:
+            zeit, alter, zeilen = "nie", "!", "-"
+            veraltet += 1
+
+        letzter_fehler = "-"
+        if fehler:
+            # Ein Fehler zaehlt nur, wenn er neuer ist als der letzte Erfolg.
+            if not erfolg or fehler["abruf_utc"] > erfolg["abruf_utc"]:
+                f_lokal, _ = _lokal(fehler["abruf_utc"])
+                letzter_fehler = "%s  %s" % (f_lokal.strftime("%d.%m. %H:%M"),
+                                             (fehler["fehler"] or "")[:40])
+
+        markierung = "" if label in aus_config else "  (nicht in der Konfiguration)"
+        print("%-16s %-19s %-12s %8s  %s%s"
+              % (label, zeit, alter, zeilen, letzter_fehler, markierung))
+
+    # Naechste anstehende Prognose als Plausibilitaetspruefung
+    zeile = conn.execute(
+        "SELECT standort, prognosetag, wert FROM prognose_aktuell"
+        " WHERE typ='watt_hours_day' AND prognosetag >= ?"
+        " ORDER BY prognosetag LIMIT 1", (heute.isoformat(),)).fetchone()
+    if zeile:
+        print("\nJuengste Prognose: %s am %s -> %.1f kWh"
+              % (zeile["standort"], zeile["prognosetag"], zeile["wert"] / 1000.0))
+
+    conn.close()
+    print("\n%d von %d Standort(en) heute geladen." % (aktuell, aktuell + veraltet))
+    if veraltet:
+        print("Mit ! markierte Standorte sind nicht auf dem heutigen Stand.")
+        return 1
+    return 0
+
+
 def notify(cfg, standort, fehler):
     cmd = cfg["notify_command"]
     if not cmd:
@@ -414,6 +525,8 @@ def main():
     ap.add_argument("--config", default=None, help="Pfad zur Konfigurationsdatei")
     ap.add_argument("--init-config", action="store_true",
                     help="einmalig eine Konfiguration aus der Vorlage anlegen und beenden")
+    ap.add_argument("--status", action="store_true",
+                    help="Bericht zum letzten Lauf je Standort; Exit 1, wenn etwas veraltet ist")
     ap.add_argument("--force", action="store_true",
                     help="auch abrufen, wenn heute bereits erfolgreich geladen wurde")
     ap.add_argument("--dry-run", action="store_true",
@@ -425,6 +538,12 @@ def main():
         return init_config(args.config)
 
     cfg, standorte = load_config(find_config(args.config))
+
+    # Bewusst vor setup_logging und open_db: ein Statusabruf soll weder eine
+    # Logzeile noch eine leere Datenbank hinterlassen.
+    if args.status:
+        return show_status(cfg, standorte)
+
     setup_logging(cfg["log_file"], args.verbose)
 
     conn = open_db(cfg["db_path"])

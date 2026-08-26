@@ -15,18 +15,27 @@ sind keine `pip`-Pakete nötig.
 
 ## Wo was liegt
 
-Code, Konfiguration und Daten sind bewusst getrennt, damit ein `git pull` immer
-nur den Code aktualisiert und deine Einstellungen und Messwerte nie anfasst:
+Alles liegt in einem Verzeichnis, im Beispiel `/home/nicolas/scripts/Solarprognose_loggen`:
 
-| | Ort | |
-|---|---|---|
-| Code | `~/Solarprognose_loggen` | kommt aus Git, wird überschrieben |
-| Konfiguration | `~/.config/solarprognose/config.ini` | einmalig anlegen, bleibt für immer |
-| Daten | `~/solarprognose/` | TXT-Dateien, Datenbank, Logs |
+```
+Solarprognose_loggen/
+  solarprognose.py            aus Git, wird von git pull aktualisiert
+  config.example.ini          aus Git, Vorlage
+  config.ini                  deine Einstellungen, in .gitignore
+  data/                       die TXT-Dateien
+  logs/solarprognose.log      Protokoll
+  solarprognose.db            SQLite-Datenbank fuer Grafana
+```
 
-Beide Pfade sind verschiebbar: die Konfiguration über `--config` oder die
-Umgebungsvariable `SOLARPROGNOSE_CONFIG`, das Datenverzeichnis über `base_dir`
-in der Konfiguration.
+`config.ini`, `data/`, `logs/` und `*.db` stehen in `.gitignore`. Ein `git pull`
+aktualisiert daher nur den Code und fasst deine Einstellungen und Messwerte nicht
+an. Verschieben lässt sich beides trotzdem: die Konfiguration über `--config` oder
+`$SOLARPROGNOSE_CONFIG`, das Datenverzeichnis über `base_dir` in der Konfiguration.
+
+> **Achtung:** Da die Daten im Git-Arbeitsverzeichnis liegen, würde ein
+> `git clean -xdf` sie mitlöschen — dieser Befehl entfernt auch ignorierte
+> Dateien. `git pull`, `git checkout` und `git reset --hard` sind dagegen
+> unbedenklich.
 
 ---
 
@@ -38,41 +47,38 @@ bereits mit, `python3 --version` bestätigt das.
 Repository klonen:
 
 ```bash
-cd ~ && git clone https://github.com/nicolasasauer/Solarprognose_loggen.git
+mkdir -p ~/scripts && cd ~/scripts && git clone https://github.com/nicolasasauer/Solarprognose_loggen.git
 ```
 
 Konfiguration einmalig anlegen:
 
 ```bash
-python3 ~/Solarprognose_loggen/solarprognose.py --init-config
+python3 /home/nicolas/scripts/Solarprognose_loggen/solarprognose.py --init-config
 ```
 
 Standorte eintragen:
 
 ```bash
-nano ~/.config/solarprognose/config.ini
+nano /home/nicolas/scripts/Solarprognose_loggen/config.ini
 ```
 
 Testlauf, der abruft und prüft, aber nichts schreibt:
 
 ```bash
-python3 ~/Solarprognose_loggen/solarprognose.py --dry-run -v
+python3 /home/nicolas/scripts/Solarprognose_loggen/solarprognose.py --dry-run -v
 ```
 
 Ab jetzt genügt für Code-Updates:
 
 ```bash
-cd ~/Solarprognose_loggen && git pull
+cd /home/nicolas/scripts/Solarprognose_loggen && git pull
 ```
-
-Deine `config.ini` liegt außerhalb des Repositorys und bleibt davon unberührt.
-Selbst ein komplett neues `git clone` würde sie nicht antasten.
 
 ---
 
 ## Konfiguration
 
-Alles steckt in `~/.config/solarprognose/config.ini`. Pro Anlage ein Abschnitt
+Alles steckt in `config.ini` neben dem Skript. Pro Anlage ein Abschnitt
 `[Standort:LABEL]`; das Label landet unverändert im Dateinamen und in der Datenbank.
 
 ```ini
@@ -95,7 +101,7 @@ Wichtige Schalter im Abschnitt `[global]`:
 
 | Schlüssel | Bedeutung |
 |---|---|
-| `base_dir` | Basis für alle relativen Pfade, ohne Angabe `~/solarprognose` |
+| `base_dir` | Basis für alle relativen Pfade, ohne Angabe das Skriptverzeichnis |
 | `timeout_seconds` | Zeitlimit pro HTTP-Versuch (Standard 60) |
 | `retries` | Versuche pro Standort und Lauf (Standard 3) |
 | `retry_delay_seconds` | Wartezeit zwischen Versuchen, wächst mit jedem Versuch |
@@ -110,14 +116,15 @@ Wichtige Schalter im Abschnitt `[global]`:
 `crontab -e` öffnen und eintragen:
 
 ```cron
-0 5  * * * /usr/bin/python3 /home/pi/Solarprognose_loggen/solarprognose.py
-0 8  * * * /usr/bin/python3 /home/pi/Solarprognose_loggen/solarprognose.py
-0 11 * * * /usr/bin/python3 /home/pi/Solarprognose_loggen/solarprognose.py
+0 5  * * * /usr/bin/python3 /home/nicolas/scripts/Solarprognose_loggen/solarprognose.py >> /home/nicolas/scripts/Solarprognose_loggen/cron.log 2>&1
+0 8  * * * /usr/bin/python3 /home/nicolas/scripts/Solarprognose_loggen/solarprognose.py >> /home/nicolas/scripts/Solarprognose_loggen/cron.log 2>&1
+0 11 * * * /usr/bin/python3 /home/nicolas/scripts/Solarprognose_loggen/solarprognose.py >> /home/nicolas/scripts/Solarprognose_loggen/cron.log 2>&1
 ```
 
-Cron kennt keine Tilde, deshalb der ausgeschriebene Pfad. Heißt dein Benutzer
-nicht `pi` — bei aktuellen Raspberry-Pi-OS-Installationen wählst du den Namen
-selbst — dann ersetze ihn; `echo $HOME` verrät dir den richtigen Pfad.
+Cron kennt keine Tilde, deshalb der ausgeschriebene Pfad. Die Umleitung nach
+`cron.log` fängt Fehler ab, die auftreten, *bevor* das Skript startet — etwa ein
+falscher Pfad oder ein fehlendes `python3`. In solchen Fällen gäbe es kein
+Skript-Log, in dem man nachsehen könnte.
 
 Der Trick liegt in `skip_if_already_fetched_today`: Der 5-Uhr-Lauf holt die Daten,
 die Läufe um 8 und 11 Uhr sehen den erfolgreichen Eintrag in der Tabelle `abruf`
@@ -132,7 +139,7 @@ versucht (0 s / 60 s / 120 s), sodass kurze Störungen gar nicht erst auffallen.
 Ein einzelner Standort lässt sich jederzeit von Hand nachziehen:
 
 ```bash
-python3 ~/Solarprognose_loggen/solarprognose.py --force
+python3 /home/nicolas/scripts/Solarprognose_loggen/solarprognose.py --force
 ```
 
 ---
@@ -181,11 +188,11 @@ sudo grafana-cli plugins install frser-sqlite-datasource && sudo systemctl resta
 ```
 
 Anschließend eine Datenquelle vom Typ *SQLite* mit dem Pfad zur `solarprognose.db`
-anlegen — standardmäßig `~/solarprognose/solarprognose.db`. Der Grafana-Benutzer
+anlegen — standardmäßig `/home/nicolas/scripts/Solarprognose_loggen/solarprognose.db`. Der Grafana-Benutzer
 braucht Leserechte auf die Datei und auf das darüberliegende Verzeichnis:
 
 ```bash
-sudo chmod o+rx ~/solarprognose && sudo chmod o+r ~/solarprognose/solarprognose.db
+sudo chmod o+rx /home/nicolas/scripts/Solarprognose_loggen && sudo chmod o+r /home/nicolas/scripts/Solarprognose_loggen/solarprognose.db
 ```
 
 Die Datenbank läuft bewusst nicht im WAL-Modus, denn dort bräuchte selbst ein
@@ -229,14 +236,48 @@ liegen.
 
 ## Betrieb
 
-Das Skript protokolliert nach `~/solarprognose/logs/solarprognose.log` (rotierend, fünf Dateien à
+### Hat der Lauf geklappt?
+
+Der schnellste Weg ist der Statusbericht:
+
+```bash
+python3 /home/nicolas/scripts/Solarprognose_loggen/solarprognose.py --status
+```
+
+```
+Konfiguration : /home/nicolas/scripts/Solarprognose_loggen/config.ini
+Datenbasis    : /home/nicolas/scripts/Solarprognose_loggen
+Datenbank     : .../solarprognose.db (48.0 KB, 92 Datensaetze)
+
+STANDORT         LETZTER ERFOLG      ALTER          ZEILEN  LETZTER FEHLER
+--------------------------------------------------------------------------
+RT_Tr            2026-08-27 05:00    41 Min             92  -
+Garage_Ost       nie                 !                   -  -
+Carport_West     2026-08-24 05:00    ! 3 Tage           92  27.08. 05:00  Netzwerkfehler
+
+Juengste Prognose: RT_Tr am 2026-08-27 -> 1.8 kWh
+
+1 von 3 Standort(en) heute geladen.
+Mit ! markierte Standorte sind nicht auf dem heutigen Stand.
+```
+
+Der Befehl liest nur und legt weder Datenbank noch Logzeile an. Sein Exit-Code ist
+`0`, wenn **alle** Standorte heute geladen wurden, sonst `1` — damit lässt er sich
+direkt in eine Überwachung hängen. Ein Standort, der in der Datenbank steht, aber
+nicht mehr in der Konfiguration, wird eigens gekennzeichnet; das passiert, wenn du
+ein Label umbenennst. Die Spalte *Letzter Fehler* bleibt leer, solange der letzte
+Fehlversuch älter ist als der letzte Erfolg.
+
+### Log und Rohdaten
+
+Das Skript protokolliert nach `/home/nicolas/scripts/Solarprognose_loggen/logs/solarprognose.log` (rotierend, fünf Dateien à
 1 MB). Der Exit-Code ist `0` bei Erfolg und `1`, sobald mindestens ein Standort
 endgültig gescheitert ist.
 
 Fehlgeschlagene Läufe der letzten Woche anzeigen:
 
 ```bash
-sqlite3 ~/solarprognose/solarprognose.db "SELECT abruf_utc, standort, fehler FROM abruf WHERE erfolg=0 AND abruf_utc > datetime('now','-7 days');"
+sqlite3 /home/nicolas/scripts/Solarprognose_loggen/solarprognose.db "SELECT abruf_utc, standort, fehler FROM abruf WHERE erfolg=0 AND abruf_utc > datetime('now','-7 days');"
 ```
 
 Für eine aktive Benachrichtigung lässt sich `notify_command` in der Konfiguration

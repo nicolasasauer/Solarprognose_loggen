@@ -4,6 +4,7 @@ config.ini
 # Laufzeitdaten
 data/
 logs/
+cron.log
 *.db
 *.db-wal
 *.db-shm
