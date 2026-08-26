@@ -108,7 +108,10 @@ def setup_logging(log_file, verbose):
 # --------------------------------------------------------------------------
 
 SCHEMA = """
-PRAGMA journal_mode = WAL;
+-- Bewusst kein WAL: im WAL-Modus braucht selbst ein reiner Leser (Grafana)
+-- Schreibrechte auf die -shm-Datei. Bei einem Schreibvorgang pro Tag ist
+-- der klassische Journal-Modus die einfachere und sicherere Wahl.
+PRAGMA journal_mode = DELETE;
 
 CREATE TABLE IF NOT EXISTS abruf (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
