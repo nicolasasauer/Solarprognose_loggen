@@ -29,6 +29,7 @@ from zoneinfo import ZoneInfo
 API_BASE = "https://api.forecast.solar/estimate"
 USER_AGENT = "solarprognose-logger/1.0 (+stdlib)"
 VALID_TYPES = ("watts", "watt_hours_period", "watt_hours", "watt_hours_day")
+TXT_MODI = ("first_of_day", "every_run", "timestamped")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOCAL_CONFIG = os.path.join(HERE, "config.ini")
@@ -113,6 +114,17 @@ def init_config(target=None):
     return 0
 
 
+def _min_interval(g):
+    """Mindestabstand zwischen zwei Abrufen desselben Standorts in Minuten.
+
+    Der aeltere Schalter skip_if_already_fetched_today bleibt gueltig und
+    entspricht 1440 Minuten, damit bestehende Konfigurationen weiterlaufen.
+    """
+    if g.get("min_interval_minutes", "").strip():
+        return max(0, g.getint("min_interval_minutes"))
+    return 1440 if g.getboolean("skip_if_already_fetched_today", True) else 0
+
+
 def load_config(path):
     cp = configparser.ConfigParser()
     cp.read(path, encoding="utf-8")
@@ -148,9 +160,14 @@ def load_config(path):
         "retries": max(1, g.getint("retries", 3)),
         "retry_delay": g.getint("retry_delay_seconds", 60),
         "delay_between": g.getint("delay_between_locations", 10),
-        "skip_if_done": g.getboolean("skip_if_already_fetched_today", True),
+        "min_interval": _min_interval(g),
+        "txt_mode": g.get("txt_mode", "first_of_day").strip().lower(),
+        "prune_days": g.getint("prune_prognose_after_days", 0),
         "notify_command": g.get("notify_command", "").strip(),
     }
+    if cfg["txt_mode"] not in TXT_MODI:
+        raise SystemExit("txt_mode muss einer von %s sein, nicht '%s'"
+                         % (", ".join(TXT_MODI), cfg["txt_mode"]))
 
     standorte = [Standort(s.split(":", 1)[1].strip(), cp[s])
                  for s in cp.sections() if s.startswith("Standort:")]
@@ -218,6 +235,23 @@ FROM prognose p
 JOIN (SELECT standort, MAX(abruf_epoch) AS max_epoch
       FROM prognose GROUP BY standort) m
   ON m.standort = p.standort AND m.max_epoch = p.abruf_epoch;
+
+-- Streuung ueber alle Abrufe hinweg: wie stark wurde eine Stunde im Lauf
+-- des Tages nach oben oder unten korrigiert? Nur sinnvoll, wenn mehrmals
+-- taeglich abgerufen wird.
+CREATE VIEW IF NOT EXISTS prognose_spanne AS
+SELECT standort,
+       typ,
+       zeit_utc,
+       zeit_epoch,
+       prognosetag,
+       COUNT(*)                AS anzahl,
+       MIN(wert)               AS wert_min,
+       AVG(wert)               AS wert_mittel,
+       MAX(wert)               AS wert_max,
+       MAX(wert) - MIN(wert)   AS spanne
+FROM prognose
+GROUP BY standort, typ, zeit_epoch;
 """
 
 
@@ -229,12 +263,23 @@ def open_db(path):
     return conn
 
 
-def already_fetched_today(conn, standort, today_iso):
+def letzter_erfolg_epoch(conn, standort):
+    """Zeitpunkt des letzten erfolgreichen Abrufs, oder None."""
     row = conn.execute(
-        "SELECT 1 FROM abruf WHERE standort=? AND erfolg=1"
-        " AND date(abruf_utc,'localtime')=? LIMIT 1",
-        (standort, today_iso)).fetchone()
-    return row is not None
+        "SELECT abruf_epoch FROM abruf WHERE standort=? AND erfolg=1"
+        " ORDER BY abruf_epoch DESC LIMIT 1", (standort,)).fetchone()
+    return row[0] if row else None
+
+
+def prune(conn, tage):
+    """Loescht Prognosezeilen aelterer Abrufe. 0 = nichts loeschen."""
+    if tage <= 0:
+        return 0
+    grenze = int(datetime.now(timezone.utc).timestamp()) - tage * 86400
+    cur = conn.execute("DELETE FROM prognose WHERE abruf_epoch < ?", (grenze,))
+    conn.execute("DELETE FROM abruf WHERE abruf_epoch < ? AND erfolg=1", (grenze,))
+    conn.commit()
+    return cur.rowcount
 
 
 # --------------------------------------------------------------------------
@@ -351,11 +396,27 @@ def parse_lines(lines, standort):
     return rows
 
 
-def write_txt(cfg, standort, body, run_date):
-    """Schreibt das Originalformat atomar nach <prefix>_<label>_<datum>.txt."""
+def write_txt(cfg, standort, body, jetzt_lokal):
+    """Schreibt das Originalformat atomar. Verhalten steuert txt_mode:
+
+    first_of_day  eine Datei je Tag, nur der erste erfolgreiche Lauf schreibt
+    every_run     eine Datei je Tag, jeder Lauf ueberschreibt sie
+    timestamped   eine Datei je Lauf, mit Uhrzeit im Namen
+    """
     os.makedirs(cfg["output_dir"], exist_ok=True)
-    name = "%s_%s_%s.txt" % (cfg["filename_prefix"], standort.label, run_date.isoformat())
+    tag = jetzt_lokal.strftime("%Y-%m-%d")
+    if cfg["txt_mode"] == "timestamped":
+        name = "%s_%s_%s_%s.txt" % (cfg["filename_prefix"], standort.label,
+                                    tag, jetzt_lokal.strftime("%H%M"))
+    else:
+        name = "%s_%s_%s.txt" % (cfg["filename_prefix"], standort.label, tag)
     target = os.path.join(cfg["output_dir"], name)
+
+    if cfg["txt_mode"] == "first_of_day" and os.path.exists(target):
+        log.info("[%s] Datei fuer heute existiert bereits, nur Datenbank: %s",
+                 standort.label, target)
+        return target
+
     tmp = target + ".tmp"
     with open(tmp, "w", encoding="utf-8", newline="") as fh:
         fh.write(body)
@@ -446,8 +507,8 @@ def show_status(cfg, standorte):
 
     jetzt = datetime.now(timezone.utc)
     heute = date.today()
-    kopf = "%-16s %-19s %-12s %8s  %s" % ("STANDORT", "LETZTER ERFOLG", "ALTER",
-                                          "ZEILEN", "LETZTER FEHLER")
+    kopf = "%-16s %-19s %-12s %7s %6s  %s" % ("STANDORT", "LETZTER ERFOLG", "ALTER",
+                                              "ZEILEN", "HEUTE", "LETZTER FEHLER")
     print("\n" + kopf)
     print("-" * len(kopf))
 
@@ -456,6 +517,9 @@ def show_status(cfg, standorte):
         erfolg = conn.execute(
             "SELECT abruf_utc, zeilen FROM abruf WHERE standort=? AND erfolg=1"
             " ORDER BY abruf_epoch DESC LIMIT 1", (label,)).fetchone()
+        laeufe = conn.execute(
+            "SELECT COUNT(*) FROM abruf WHERE standort=? AND erfolg=1"
+            " AND date(abruf_utc,'localtime')=?", (label, heute.isoformat())).fetchone()[0]
         fehler = conn.execute(
             "SELECT abruf_utc, fehler FROM abruf WHERE standort=? AND erfolg=0"
             " ORDER BY abruf_epoch DESC LIMIT 1", (label,)).fetchone()
@@ -483,8 +547,8 @@ def show_status(cfg, standorte):
                                              (fehler["fehler"] or "")[:40])
 
         markierung = "" if label in aus_config else "  (nicht in der Konfiguration)"
-        print("%-16s %-19s %-12s %8s  %s%s"
-              % (label, zeit, alter, zeilen, letzter_fehler, markierung))
+        print("%-16s %-19s %-12s %7s %6s  %s%s"
+              % (label, zeit, alter, zeilen, laeufe, letzter_fehler, markierung))
 
     # Naechste anstehende Prognose als Plausibilitaetspruefung
     zeile = conn.execute(
@@ -551,12 +615,17 @@ def main():
     log.info("=== Lauf gestartet (%d Standort(e), %s) ===", len(standorte), today.isoformat())
     log.debug("Konfiguration: %s | Datenverzeichnis: %s", cfg["config_path"], cfg["base_dir"])
 
+    jetzt_epoch = int(datetime.now(timezone.utc).timestamp())
     fehlgeschlagen, aktiv = [], []
     for s in standorte:
-        if cfg["skip_if_done"] and not args.force and not args.dry_run \
-                and already_fetched_today(conn, s.label, today.isoformat()):
-            log.info("[%s] heute bereits erfolgreich abgerufen - uebersprungen", s.label)
-            continue
+        if cfg["min_interval"] > 0 and not args.force and not args.dry_run:
+            letzter = letzter_erfolg_epoch(conn, s.label)
+            if letzter is not None:
+                alter_min = (jetzt_epoch - letzter) // 60
+                if alter_min < cfg["min_interval"]:
+                    log.info("[%s] letzter Erfolg vor %d Min, Mindestabstand %d Min"
+                             " - uebersprungen", s.label, alter_min, cfg["min_interval"])
+                    continue
         aktiv.append(s)
 
     for i, s in enumerate(aktiv):
@@ -573,7 +642,7 @@ def main():
                 log.info("[%s] DRY-RUN: %d Datensaetze, %s ... %s",
                          s.label, len(rows), rows[0][1], rows[-1][1])
                 continue
-            datei = write_txt(cfg, s, body, today)
+            datei = write_txt(cfg, s, body, datetime.now())
             store(conn, s, rows, datei, versuche, abruf_dt)
         except Exception as exc:
             log.error("[%s] ENDGUELTIG FEHLGESCHLAGEN: %s", s.label, exc)
@@ -581,6 +650,11 @@ def main():
                 store_failure(conn, s, exc, cfg["retries"], abruf_dt)
                 notify(cfg, s, exc)
             fehlgeschlagen.append(s.label)
+
+    geloescht = prune(conn, cfg["prune_days"])
+    if geloescht:
+        log.info("Aufbewahrung: %d Prognosezeilen aelter als %d Tage geloescht",
+                 geloescht, cfg["prune_days"])
 
     conn.close()
     if fehlgeschlagen:

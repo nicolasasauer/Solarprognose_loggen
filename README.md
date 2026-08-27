@@ -1,6 +1,6 @@
 # Solarprognose-Logger
 
-Ruft täglich die PV-Ertragsprognose von [forecast.solar](https://forecast.solar) für
+Ruft regelmäßig die PV-Ertragsprognose von [forecast.solar](https://forecast.solar) für
 mehrere Standorte ab und speichert sie doppelt:
 
 1. **als TXT-Datei** im unveränderten Originalformat der API
@@ -97,6 +97,15 @@ liefert die API ein identisches Ergebnis, das Wettermodell arbeitet ohnehin grö
 Der Dateiname entsteht aus `filename_prefix`, Label und **Abrufdatum**:
 `Solardaten_RT_Tr_2026-08-27.txt`.
 
+Wird mehrmals täglich abgerufen, steuert `txt_mode`, was mit dieser Datei
+passiert. Die Datenbank bekommt in jedem Fall **alle** Abrufe:
+
+| Wert | Verhalten |
+|---|---|
+| `first_of_day` | eine Datei je Tag, nur der erste erfolgreiche Lauf schreibt sie — spätere Läufe gehen nur in die Datenbank |
+| `every_run` | eine Datei je Tag, jeder Lauf überschreibt sie mit der neuesten Prognose |
+| `timestamped` | eine Datei je Lauf, `Solardaten_RT_Tr_2026-08-27_0500.txt` |
+
 Wichtige Schalter im Abschnitt `[global]`:
 
 | Schlüssel | Bedeutung |
@@ -106,7 +115,9 @@ Wichtige Schalter im Abschnitt `[global]`:
 | `retries` | Versuche pro Standort und Lauf (Standard 3) |
 | `retry_delay_seconds` | Wartezeit zwischen Versuchen, wächst mit jedem Versuch |
 | `delay_between_locations` | Pause zwischen zwei Standorten, schont das Rate-Limit |
-| `skip_if_already_fetched_today` | überspringt Standorte, die heute schon erfolgreich geladen wurden |
+| `min_interval_minutes` | Mindestabstand zwischen zwei Abrufen desselben Standorts; `170` = dreistündlich, `1440` = täglich, `0` = nie überspringen |
+| `txt_mode` | `first_of_day`, `every_run` oder `timestamped` — siehe unten |
+| `prune_prognose_after_days` | löscht Prognosezeilen älterer Abrufe, `0` = nie |
 | `notify_command` | optionaler Befehl bei endgültigem Fehlschlag, `{standort}` und `{fehler}` werden ersetzt |
 
 ---
@@ -116,9 +127,7 @@ Wichtige Schalter im Abschnitt `[global]`:
 `crontab -e` öffnen und eintragen:
 
 ```cron
-0 5  * * * /usr/bin/python3 /home/nicolas/scripts/Solarprognose_loggen/solarprognose.py >> /home/nicolas/scripts/Solarprognose_loggen/cron.log 2>&1
-0 8  * * * /usr/bin/python3 /home/nicolas/scripts/Solarprognose_loggen/solarprognose.py >> /home/nicolas/scripts/Solarprognose_loggen/cron.log 2>&1
-0 11 * * * /usr/bin/python3 /home/nicolas/scripts/Solarprognose_loggen/solarprognose.py >> /home/nicolas/scripts/Solarprognose_loggen/cron.log 2>&1
+0 */3 * * * /usr/bin/python3 /home/nicolas/scripts/Solarprognose_loggen/solarprognose.py >> /home/nicolas/scripts/Solarprognose_loggen/cron.log 2>&1
 ```
 
 Cron kennt keine Tilde, deshalb der ausgeschriebene Pfad. Die Umleitung nach
@@ -126,12 +135,18 @@ Cron kennt keine Tilde, deshalb der ausgeschriebene Pfad. Die Umleitung nach
 falscher Pfad oder ein fehlendes `python3`. In solchen Fällen gäbe es kein
 Skript-Log, in dem man nachsehen könnte.
 
-Der Trick liegt in `skip_if_already_fetched_today`: Der 5-Uhr-Lauf holt die Daten,
-die Läufe um 8 und 11 Uhr sehen den erfolgreichen Eintrag in der Tabelle `abruf`
-und beenden sich sofort wieder. War der Morgenlauf dagegen erfolglos — weil das
-Internet weg war oder die API gestreikt hat — versucht es der nächste Lauf erneut.
-Damit gibt es einen echten Fallback über den Tag, ohne dass ein Dienst dauerhaft
-laufen muss.
+**Wie oft wirklich geladen wird, entscheidet nicht der Cron-Eintrag, sondern
+`min_interval_minutes` in der Konfiguration.** Das Skript überspringt einen
+Standort, solange sein letzter Erfolg jünger ist als dieser Abstand. Bei `170`
+und einem Cron alle drei Stunden lädt es also achtmal täglich — und wenn ein Lauf
+scheitert, holt der nächste ihn nach, ohne dass du eine zweite Cron-Zeile
+brauchst. Der Fallback ist damit automatisch eingebaut.
+
+Für den alten Betrieb einmal täglich setzt du `min_interval_minutes = 1440` und
+lässt den Cron-Eintrag unverändert dreistündlich feuern; der erste erfolgreiche
+Lauf des Tages gewinnt, alle weiteren beenden sich sofort. Der ältere Schalter
+`skip_if_already_fetched_today = true` bewirkt dasselbe und wird weiterhin
+verstanden.
 
 Innerhalb eines einzelnen Laufs wird ohnehin schon dreimal mit wachsendem Abstand
 versucht (0 s / 60 s / 120 s), sodass kurze Störungen gar nicht erst auffallen.
@@ -171,11 +186,22 @@ tatsächlichen Ertrag vergleichen.
 **`prognose_aktuell`** — dieselbe Struktur, aber gefiltert auf den jeweils
 jüngsten Abruf pro Standort. Für die meisten Grafana-Panels die richtige Quelle.
 
+**`prognose_spanne`** — fasst alle Abrufe je Zeitpunkt zusammen und liefert
+`anzahl`, `wert_min`, `wert_mittel`, `wert_max` und `spanne`. Damit siehst du,
+wie stark eine einzelne Stunde im Lauf des Tages nach oben oder unten korrigiert
+wurde. Sinnvoll nur, wenn mehrmals täglich abgerufen wird.
+
 Die vier Typen bedeuten: `watts` ist die Momentanleistung, `watt_hours_period` der
 Ertrag innerhalb der Stunde, `watt_hours` der über den Tag aufsummierte Ertrag und
 `watt_hours_day` die Tagessumme.
 
-Die kostenlose API liefert immer **heute und morgen** — mehr nicht.
+Die kostenlose API liefert immer **heute und morgen** — mehr nicht. Ein
+Zeitpunkt für einen bestimmten Tag wird daher von rund sechzehn Abrufen
+vorhergesagt: acht am Vortag und acht am Tag selbst.
+
+Bei fünf Standorten und acht Läufen täglich wächst die Datenbank um grob 150 bis
+200 MB im Jahr. Auf einer SD-Karte ist das irgendwann spürbar; `prune_prognose_after_days`
+begrenzt die Aufbewahrung, wenn du das nicht willst.
 
 ---
 
@@ -231,6 +257,65 @@ ORDER BY abruf_epoch
 Setze im Panel die Einheit auf *Watt* beziehungsweise *Kilowatt-Stunde* und
 deaktiviere bei Bedarf den Zeitfilter des Dashboards, da Prognosen in der Zukunft
 liegen.
+
+### Streuung: wie sicher ist die Prognose?
+
+Weil mehrmals täglich abgerufen wird, gibt es je Stunde mehrere Vorhersagen. Aus
+ihnen lassen sich Minimum, Mittelwert und Maximum bilden — je weiter die drei
+auseinanderliegen, desto unsicherer war sich das Modell:
+
+```sql
+SELECT zeit_epoch AS time, wert_min AS min, wert_mittel AS mittel, wert_max AS max
+FROM prognose_spanne
+WHERE typ = 'watts' AND standort = 'RT_Tr' AND prognosetag = date('now')
+ORDER BY zeit_epoch
+```
+
+Falls du die View nicht verwenden willst, tut es dieselbe Abfrage direkt im
+Panel — die View ist reine Bequemlichkeit:
+
+```sql
+SELECT zeit_epoch AS time, MIN(wert) AS min, AVG(wert) AS mittel, MAX(wert) AS max
+FROM prognose
+WHERE typ = 'watts' AND standort = 'RT_Tr' AND prognosetag = date('now')
+GROUP BY zeit_epoch
+ORDER BY zeit_epoch
+```
+
+Im Panel stellst du *mittel* als durchgezogene Linie dar und lässt *min* und *max*
+über **Fill below to** aufeinander verweisen — das ergibt ein Unsicherheitsband
+um die mittlere Prognose.
+
+### Verlauf einer einzelnen Stunde
+
+Wie hat sich die Vorhersage für eine bestimmte Stunde entwickelt? Auf der
+Zeitachse steht hier der Abrufzeitpunkt, nicht der Prognosezeitpunkt:
+
+```sql
+SELECT abruf_epoch AS time, wert AS watt
+FROM prognose
+WHERE typ = 'watts' AND standort = 'RT_Tr'
+  AND zeit_lokal = date('now') || ' 12:00:00'
+ORDER BY abruf_epoch
+```
+
+### Wie oft ändern sich die Werte überhaupt?
+
+Das Modell hinter forecast.solar aktualisiert deutlich seltener als stündlich.
+Nach ein paar Tagen Betrieb zeigt dir diese Abfrage, wie viele der Abrufe
+tatsächlich neue Werte gebracht haben — damit kannst du `min_interval_minutes`
+begründet nachjustieren:
+
+```sql
+SELECT prognosetag,
+       COUNT(*)                       AS zeitpunkte,
+       SUM(CASE WHEN spanne > 0 THEN 1 ELSE 0 END) AS davon_korrigiert,
+       ROUND(AVG(anzahl), 1)          AS abrufe_je_zeitpunkt
+FROM prognose_spanne
+WHERE typ = 'watts' AND standort = 'RT_Tr'
+GROUP BY prognosetag
+ORDER BY prognosetag DESC
+```
 
 ---
 
