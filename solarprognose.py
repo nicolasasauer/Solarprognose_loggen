@@ -3,11 +3,13 @@
 
 Nur Standardbibliothek - auf einem Raspberry Pi (Python 3.9+) ohne pip lauffaehig.
 Aufruf:  ./solarprognose.py [--config PFAD] [--force] [--dry-run] [--status]
+         ./solarprognose.py --init-config | --print-cron | --install-cron
 
-Konfiguration und Daten liegen standardmaessig neben dem Skript, also z.B. in
-/home/nicolas/scripts/Solarprognose_loggen/ mit config.ini, data/, logs/ und
-solarprognose.db. Alle diese Namen stehen in .gitignore, ein "git pull" fasst
-sie also nicht an. Verschiebbar ueber --config bzw. base_dir.
+Konfiguration und Daten liegen standardmaessig neben dem Skript, also im
+geklonten Verzeichnis selbst: config.ini, data/, logs/ und solarprognose.db.
+Das Skript ermittelt seinen eigenen Ort und funktioniert dadurch unter jedem
+Pfad und Benutzernamen. Alle erzeugten Namen stehen in .gitignore, ein
+"git pull" fasst sie also nicht an. Verschiebbar ueber --config bzw. base_dir.
 """
 
 import argparse
@@ -567,6 +569,64 @@ def show_status(cfg, standorte):
     return 0
 
 
+# --------------------------------------------------------------------------
+# Cron-Einrichtung
+# --------------------------------------------------------------------------
+
+def cron_zeile(cfg):
+    """Fertige crontab-Zeile mit den tatsaechlichen Pfaden dieser Installation."""
+    skript = os.path.join(HERE, os.path.basename(os.path.abspath(__file__)))
+    python = sys.executable or "/usr/bin/python3"
+    logziel = os.path.join(cfg["base_dir"], "cron.log")
+    # Der Cron darf ruhig oefter feuern, als geladen werden soll: ueberzaehlige
+    # Laeufe beenden sich wegen min_interval_minutes sofort und dienen als
+    # Fallback, falls ein Lauf gescheitert ist.
+    takt = "0 * * * *" if 0 < cfg["min_interval"] <= 60 else "0 */3 * * *"
+    return "%s %s %s >> %s 2>&1" % (takt, python, skript, logziel)
+
+
+def print_cron(cfg):
+    """Nur die Zeile nach stdout, damit sie sich weiterleiten laesst."""
+    sys.stderr.write(
+        "Diese Zeile gehoert in die crontab. Entweder mit 'crontab -e'\n"
+        "einfuegen, oder automatisch eintragen lassen mit:\n"
+        "  python3 %s --install-cron\n\n"
+        % os.path.join(HERE, "solarprognose.py"))
+    print(cron_zeile(cfg))
+    return 0
+
+
+def install_cron(cfg):
+    """Traegt die Zeile in die crontab des aktuellen Benutzers ein."""
+    zeile = cron_zeile(cfg)
+    try:
+        vorher = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    except (FileNotFoundError, OSError) as exc:
+        raise SystemExit("crontab ist auf diesem System nicht verfuegbar (%s).\n"
+                         "Zeile von Hand eintragen:\n  %s" % (exc, zeile))
+
+    bestand = vorher.stdout.splitlines() if vorher.returncode == 0 else []
+    behalten = [z for z in bestand if "solarprognose.py" not in z]
+    ersetzt = len(bestand) - len(behalten)
+
+    if bestand and behalten + [zeile] == bestand:
+        print("Der Eintrag steht bereits unveraendert in der crontab:\n  %s" % zeile)
+        return 0
+
+    inhalt = "\n".join(behalten + [zeile]) + "\n"
+    ergebnis = subprocess.run(["crontab", "-"], input=inhalt, text=True,
+                              capture_output=True)
+    if ergebnis.returncode != 0:
+        raise SystemExit("crontab konnte nicht geschrieben werden:\n%s\n"
+                         "Zeile von Hand eintragen:\n  %s"
+                         % (ergebnis.stderr.strip(), zeile))
+
+    if ersetzt:
+        print("%d aeltere(n) Eintrag/Eintraege fuer solarprognose.py ersetzt." % ersetzt)
+    print("Eingetragen:\n  %s\n\nKontrolle mit:\n  crontab -l" % zeile)
+    return 0
+
+
 def notify(cfg, standort, fehler):
     cmd = cfg["notify_command"]
     if not cmd:
@@ -591,6 +651,10 @@ def main():
                     help="einmalig eine Konfiguration aus der Vorlage anlegen und beenden")
     ap.add_argument("--status", action="store_true",
                     help="Bericht zum letzten Lauf je Standort; Exit 1, wenn etwas veraltet ist")
+    ap.add_argument("--print-cron", action="store_true",
+                    help="passende crontab-Zeile fuer diese Installation ausgeben")
+    ap.add_argument("--install-cron", action="store_true",
+                    help="diese Zeile gleich in die crontab eintragen")
     ap.add_argument("--force", action="store_true",
                     help="auch abrufen, wenn heute bereits erfolgreich geladen wurde")
     ap.add_argument("--dry-run", action="store_true",
@@ -607,6 +671,10 @@ def main():
     # Logzeile noch eine leere Datenbank hinterlassen.
     if args.status:
         return show_status(cfg, standorte)
+    if args.print_cron:
+        return print_cron(cfg)
+    if args.install_cron:
+        return install_cron(cfg)
 
     setup_logging(cfg["log_file"], args.verbose)
 

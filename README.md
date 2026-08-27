@@ -15,7 +15,9 @@ sind keine `pip`-Pakete nötig.
 
 ## Wo was liegt
 
-Alles liegt in einem Verzeichnis, im Beispiel `/home/nicolas/scripts/Solarprognose_loggen`:
+Alles liegt in dem Verzeichnis, in das du das Repository geklont hast — egal
+wo das ist und wie der Benutzer heisst. Das Skript ermittelt seinen eigenen
+Ort und richtet alle Pfade daran aus:
 
 ```
 Solarprognose_loggen/
@@ -44,35 +46,40 @@ an. Verschieben lässt sich beides trotzdem: die Konfiguration über `--config` 
 Voraussetzung ist Python 3.9 oder neuer — Raspberry Pi OS Bookworm bringt 3.11
 bereits mit, `python3 --version` bestätigt das.
 
-Repository klonen:
+Repository klonen und hineinwechseln — der Ort ist frei wählbar:
 
 ```bash
-mkdir -p ~/scripts && cd ~/scripts && git clone https://github.com/nicolasasauer/Solarprognose_loggen.git
+git clone https://github.com/nicolasasauer/Solarprognose_loggen.git && cd Solarprognose_loggen
 ```
 
 Konfiguration einmalig anlegen:
 
 ```bash
-python3 /home/nicolas/scripts/Solarprognose_loggen/solarprognose.py --init-config
+python3 solarprognose.py --init-config
 ```
 
 Standorte eintragen:
 
 ```bash
-nano /home/nicolas/scripts/Solarprognose_loggen/config.ini
+nano config.ini
 ```
 
 Testlauf, der abruft und prüft, aber nichts schreibt:
 
 ```bash
-python3 /home/nicolas/scripts/Solarprognose_loggen/solarprognose.py --dry-run -v
+python3 solarprognose.py --dry-run -v
 ```
 
-Ab jetzt genügt für Code-Updates:
+Cron-Eintrag setzen — die Pfade ermittelt das Skript selbst:
 
 ```bash
-cd /home/nicolas/scripts/Solarprognose_loggen && git pull
+python3 solarprognose.py --install-cron
 ```
+
+Ab jetzt genügt für Code-Updates ein `git pull` in diesem Verzeichnis.
+
+Alle weiteren Befehle in diesem README werden aus dem Klonverzeichnis heraus
+aufgerufen.
 
 ---
 
@@ -124,16 +131,32 @@ Wichtige Schalter im Abschnitt `[global]`:
 
 ## Zeitsteuerung per Cron
 
-`crontab -e` öffnen und eintragen:
+Cron braucht absolute Pfade und kennt keine Tilde. Statt sie abzutippen, lässt
+du sie dir vom Skript erzeugen:
 
-```cron
-0 */3 * * * /usr/bin/python3 /home/nicolas/scripts/Solarprognose_loggen/solarprognose.py >> /home/nicolas/scripts/Solarprognose_loggen/cron.log 2>&1
+```bash
+python3 solarprognose.py --install-cron
 ```
 
-Cron kennt keine Tilde, deshalb der ausgeschriebene Pfad. Die Umleitung nach
-`cron.log` fängt Fehler ab, die auftreten, *bevor* das Skript startet — etwa ein
-falscher Pfad oder ein fehlendes `python3`. In solchen Fällen gäbe es kein
-Skript-Log, in dem man nachsehen könnte.
+Das trägt die Zeile direkt in die crontab deines Benutzers ein, ersetzt dabei
+einen eventuellen älteren Eintrag für dieses Skript und lässt alle anderen
+Einträge unberührt. Ein zweiter Aufruf ändert nichts mehr.
+
+Wenn du lieber selbst Hand anlegst, gibt dir
+
+```bash
+python3 solarprognose.py --print-cron
+```
+
+dieselbe Zeile nur aus, zum Kopieren in `crontab -e`. Sie sieht etwa so aus:
+
+```cron
+0 */3 * * * /usr/bin/python3 /pfad/zum/Solarprognose_loggen/solarprognose.py >> /pfad/zum/Solarprognose_loggen/cron.log 2>&1
+```
+
+Die Umleitung nach `cron.log` fängt Fehler ab, die auftreten, *bevor* das Skript
+startet — etwa ein falscher Pfad oder ein fehlendes `python3`. In solchen Fällen
+gäbe es kein Skript-Log, in dem man nachsehen könnte.
 
 **Wie oft wirklich geladen wird, entscheidet nicht der Cron-Eintrag, sondern
 `min_interval_minutes` in der Konfiguration.** Das Skript überspringt einen
@@ -154,7 +177,7 @@ versucht (0 s / 60 s / 120 s), sodass kurze Störungen gar nicht erst auffallen.
 Ein einzelner Standort lässt sich jederzeit von Hand nachziehen:
 
 ```bash
-python3 /home/nicolas/scripts/Solarprognose_loggen/solarprognose.py --force
+python3 solarprognose.py --force
 ```
 
 ---
@@ -214,11 +237,12 @@ sudo grafana-cli plugins install frser-sqlite-datasource && sudo systemctl resta
 ```
 
 Anschließend eine Datenquelle vom Typ *SQLite* mit dem Pfad zur `solarprognose.db`
-anlegen — standardmäßig `/home/nicolas/scripts/Solarprognose_loggen/solarprognose.db`. Der Grafana-Benutzer
+anlegen. Den genauen Pfad nennt dir `python3 solarprognose.py --status`.
+Der Grafana-Benutzer
 braucht Leserechte auf die Datei und auf das darüberliegende Verzeichnis:
 
 ```bash
-sudo chmod o+rx /home/nicolas/scripts/Solarprognose_loggen && sudo chmod o+r /home/nicolas/scripts/Solarprognose_loggen/solarprognose.db
+sudo chmod o+rx "$PWD" && sudo chmod o+r "$PWD/solarprognose.db"
 ```
 
 Die Datenbank läuft bewusst nicht im WAL-Modus, denn dort bräuchte selbst ein
@@ -326,13 +350,13 @@ ORDER BY prognosetag DESC
 Der schnellste Weg ist der Statusbericht:
 
 ```bash
-python3 /home/nicolas/scripts/Solarprognose_loggen/solarprognose.py --status
+python3 solarprognose.py --status
 ```
 
 ```
-Konfiguration : /home/nicolas/scripts/Solarprognose_loggen/config.ini
-Datenbasis    : /home/nicolas/scripts/Solarprognose_loggen
-Datenbank     : .../solarprognose.db (48.0 KB, 92 Datensaetze)
+Konfiguration : /home/pi/Solarprognose_loggen/config.ini
+Datenbasis    : /home/pi/Solarprognose_loggen
+Datenbank     : /home/pi/Solarprognose_loggen/solarprognose.db (48.0 KB, 92 Datensaetze)
 
 STANDORT         LETZTER ERFOLG      ALTER          ZEILEN  LETZTER FEHLER
 --------------------------------------------------------------------------
@@ -355,14 +379,14 @@ Fehlversuch älter ist als der letzte Erfolg.
 
 ### Log und Rohdaten
 
-Das Skript protokolliert nach `/home/nicolas/scripts/Solarprognose_loggen/logs/solarprognose.log` (rotierend, fünf Dateien à
+Das Skript protokolliert nach `logs/solarprognose.log` (rotierend, fünf Dateien à
 1 MB). Der Exit-Code ist `0` bei Erfolg und `1`, sobald mindestens ein Standort
 endgültig gescheitert ist.
 
 Fehlgeschlagene Läufe der letzten Woche anzeigen:
 
 ```bash
-sqlite3 /home/nicolas/scripts/Solarprognose_loggen/solarprognose.db "SELECT abruf_utc, standort, fehler FROM abruf WHERE erfolg=0 AND abruf_utc > datetime('now','-7 days');"
+sqlite3 solarprognose.db "SELECT abruf_utc, standort, fehler FROM abruf WHERE erfolg=0 AND abruf_utc > datetime('now','-7 days');"
 ```
 
 Für eine aktive Benachrichtigung lässt sich `notify_command` in der Konfiguration
