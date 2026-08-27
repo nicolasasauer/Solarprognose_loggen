@@ -582,7 +582,10 @@ def cron_zeile(cfg):
     # Laeufe beenden sich wegen min_interval_minutes sofort und dienen als
     # Fallback, falls ein Lauf gescheitert ist.
     takt = "0 * * * *" if 0 < cfg["min_interval"] <= 60 else "0 */3 * * *"
-    return "%s %s %s >> %s 2>&1" % (takt, python, skript, logziel)
+    # Cron uebergibt die Zeile an die Shell: Pfade mit Leerzeichen wuerden sonst
+    # zerlegt. shlex.quote laesst unproblematische Pfade unveraendert.
+    return "%s %s %s >> %s 2>&1" % (takt, shlex.quote(python), shlex.quote(skript),
+                                    shlex.quote(logziel))
 
 
 def print_cron(cfg):
